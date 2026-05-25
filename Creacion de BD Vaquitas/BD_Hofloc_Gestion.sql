@@ -599,15 +599,27 @@ CREATE TABLE tbl_baja_animal (
 --  BLOQUE 12: GESTIÓN DE INSUMOS
 -- ════════════════════════════════════════════════════════════════════════════
 
+CREATE TABLE tbl_categoria_insumo (
+    id_categoria_insumo INT AUTO_INCREMENT PRIMARY KEY,
+    nombre_categoria    VARCHAR(80) NOT NULL UNIQUE,
+    descripcion         VARCHAR(255) NULL,
+    activo              BOOLEAN NOT NULL DEFAULT TRUE,
+    fecha_creacion      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB COMMENT='Categorías de insumos (concentrado, forraje, medicina, etc.)';
+
 CREATE TABLE tbl_insumo (
-    id_insumo      INT AUTO_INCREMENT PRIMARY KEY,
-    nombre         VARCHAR(120) NOT NULL UNIQUE,
-    unidad         VARCHAR(20)  NOT NULL,
-    icono          VARCHAR(60)  NULL,
-    stock_actual   DECIMAL(10,2) NOT NULL DEFAULT 0,
-    stock_minimo   DECIMAL(10,2) NOT NULL DEFAULT 0,
-    activo         BOOLEAN   NOT NULL DEFAULT TRUE,
-    fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    id_insumo           INT AUTO_INCREMENT PRIMARY KEY,
+    id_categoria_insumo INT NOT NULL,
+    nombre              VARCHAR(120) NOT NULL UNIQUE,
+    unidad              VARCHAR(20)  NOT NULL,
+    icono               VARCHAR(60)  NULL,
+    stock_actual        DECIMAL(10,2) NOT NULL DEFAULT 0,
+    stock_minimo        DECIMAL(10,2) NOT NULL DEFAULT 0,
+    activo              BOOLEAN   NOT NULL DEFAULT TRUE,
+    fecha_creacion      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_insumo_categoria FOREIGN KEY (id_categoria_insumo)
+        REFERENCES tbl_categoria_insumo(id_categoria_insumo) ON UPDATE CASCADE ON DELETE RESTRICT,
+    INDEX idx_insumo_categoria (id_categoria_insumo),
     INDEX idx_insumo_activo (activo)
 ) ENGINE=InnoDB COMMENT='Catálogo de insumos (concentrado, heno, sal, etc.)';
 
