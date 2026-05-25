@@ -688,6 +688,62 @@ FROM tbl_transaccion_financiera
 GROUP BY YEAR(fecha_transaccion), MONTH(fecha_transaccion)
 ORDER BY anio DESC, mes DESC;
 
+-- VW9: Expediente Sanitario de Animales
+CREATE OR REPLACE VIEW vw_expediente_sanitario AS
+SELECT 
+    rta.id_animal,
+    a.arete,
+    rs.fecha_aplicacion,
+    rs.categoria AS tipo_registro,
+    CONCAT(
+        COALESCE(c.detalle_causa, c.causa_principal, 'Sin diagnóstico'), 
+        ' — ', 
+        COALESCE(ps.nombre, 'Sin producto')
+    ) AS detalle_tratamiento,
+    CONCAT(rs.dosis_valor, ' ', rs.dosis_unidad) AS dosis_aplicada,
+    col.nombre AS veterinario_responsable,
+    prog.fecha_programada AS proxima_dosis_revision,
+    rs.id_registro_san,
+    rta.estado_aplicacion
+FROM tbl_registro_sanitario_animal rta
+JOIN tbl_registro_sanitario rs ON rta.id_registro_san = rs.id_registro_san
+JOIN tbl_animal a ON rta.id_animal = a.id_animal
+LEFT JOIN tbl_producto_sanitario ps ON rs.id_producto = ps.id_producto
+LEFT JOIN tbl_causa c ON rs.id_causa = c.id_causa
+LEFT JOIN tbl_colaborador col ON rs.id_veterinario = col.id_colaborador
+LEFT JOIN tbl_programacion_sanitaria prog ON rs.id_registro_san = prog.id_registro_san 
+    AND prog.estado = 'Pendiente';
+
+-- VW10: Expediente Reproductivo de Animales
+CREATE OR REPLACE VIEW vw_expediente_reproductivo AS
+SELECT 
+    er.id_animal,
+    a.arete,
+    er.tipo_evento AS evento,
+    er.fecha_evento AS fecha,
+    -- Combinamos la fase, causa u observaciones para el campo Detalle / Tipo / Fase
+    TRIM(BOTH ' - ' FROM CONCAT_WS(' - ', 
+        er.fase_palpacion, 
+        c.detalle_causa, 
+        er.observaciones
+    )) AS detalle,
+    -- Se muestra el número de pajilla (IA) o el arete del semental (Monta)
+    COALESCE(er.numero_pajilla, toro.arete, '-') AS semental_pajilla,
+    -- Generamos un estado amigable para la interfaz basado en los resultados
+    CASE 
+        WHEN er.resultado_palp = 'Preñez confirmada' THEN 'Confirmada'
+        WHEN er.resultado_palp = 'Preñez provisional' THEN 'Provisional'
+        WHEN er.resultado_palp IS NOT NULL AND er.resultado_palp != 'Sin evaluar' THEN er.resultado_palp
+        WHEN er.tipo_evento = 'Parto' AND er.estado_resultado = 'Realizado' THEN 'Exitoso'
+        WHEN er.tipo_evento = 'Aborto' THEN 'Aborto'
+        ELSE er.estado_resultado 
+    END AS estado,
+    er.id_evento_rep
+FROM tbl_evento_reproductivo er
+JOIN tbl_animal a ON er.id_animal = a.id_animal
+LEFT JOIN tbl_animal toro ON er.id_toro = toro.id_animal
+LEFT JOIN tbl_causa c ON er.id_causa = c.id_causa;
+
 -- ╔══════════════════════════════════════════════════════════════════════════╗
 -- ║                     FIN DEL SCRIPT v3.0 — HOFLOC.SA                     ║
 -- ╚══════════════════════════════════════════════════════════════════════════╝
