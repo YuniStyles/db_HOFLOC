@@ -324,8 +324,17 @@ erDiagram
 
     %% ── INSUMOS ────────────────────────────────────────────────────────────────
 
+    tbl_categoria_insumo {
+        INT id_categoria_insumo PK
+        VARCHAR nombre_categoria
+        VARCHAR descripcion
+        BOOLEAN activo
+        TIMESTAMP fecha_creacion
+    }
+
     tbl_insumo {
         INT id_insumo PK
+        INT id_categoria_insumo FK
         VARCHAR nombre
         VARCHAR unidad
         VARCHAR icono
@@ -525,6 +534,7 @@ erDiagram
     tbl_usuario     ||--o{ tbl_baja_animal          : "registra"
 
     %% Insumos
+    tbl_categoria_insumo ||--o{ tbl_insumo                  : "clasifica"
     tbl_insumo      ||--o{ tbl_movimiento_insumo            : "kardex"
     tbl_usuario     ||--o{ tbl_movimiento_insumo            : "registra"
     tbl_movimiento_insumo   ||--o{ tbl_produccion_concentrado_det : "detalle producción"
