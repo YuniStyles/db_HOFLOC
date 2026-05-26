@@ -403,6 +403,11 @@ CREATE TABLE tbl_producto_sanitario (
     UNIQUE KEY uq_prod_san (nombre , tipo)
 )  ENGINE=INNODB COMMENT='Catálogo de productos veterinarios';
 
+/*Añadiendo campos en registro sanitario*/
+ALTER TABLE tbl_registro_sanitario
+DROP COLUMN dosis_valor,
+DROP COLUMN dosis_unidad;
+
 -- Registro maestro del evento sanitario (cabecera)
 CREATE TABLE tbl_registro_sanitario (
     id_registro_san BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -493,6 +498,31 @@ CREATE TABLE tbl_programacion_sanitaria (
     INDEX idx_prog_fecha (fecha_programada),
     INDEX idx_prog_estado (estado)
 )  ENGINE=INNODB COMMENT='Cronograma de aplicaciones sanitarias';
+
+/*Tabla de detalle, de medicamentos animal aplicado. */
+CREATE TABLE tbl_detalle_aplicacion_sanitaria (
+    id_aplicacion BIGINT AUTO_INCREMENT PRIMARY KEY,
+    id_registro_san BIGINT NOT NULL,
+    id_animal INT NOT NULL,
+    dosis_valor DECIMAL(8 , 2 ) NOT NULL,
+    dosis_unidad ENUM('ml', 'cc', 'mg', 'g', 'uds') NOT NULL,
+    via_aplicacion ENUM('Intramuscular', 'Subcutánea', 'Oral', 'Intravenosa', 'Tópica', 'Otro') NULL,
+    peso_animal_kg DECIMAL(7 , 2 ) NULL,
+    fecha_aplicacion DATETIME NOT NULL,
+    aplicada_por VARCHAR(120) NULL,
+    reaccion_adversa BOOLEAN NOT NULL DEFAULT FALSE,
+    descripcion_reaccion VARCHAR(255) NULL,
+    observaciones TEXT NULL,
+    fecha_creacion TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_det_san FOREIGN KEY (id_registro_san)
+        REFERENCES tbl_registro_sanitario (id_registro_san)
+        ON UPDATE CASCADE ON DELETE CASCADE,
+    CONSTRAINT fk_det_animal FOREIGN KEY (id_animal)
+        REFERENCES tbl_animal (id_animal)
+        ON UPDATE CASCADE ON DELETE CASCADE,
+    INDEX idx_det_animal (id_animal),
+    INDEX idx_det_fecha (fecha_aplicacion)
+)  ENGINE=INNODB COMMENT='Detalle real de aplicaciones sanitarias por animal';
 
 -- ════════════════════════════════════════════════════════════════════════════
 --  BLOQUE 9: REPRODUCCIÓN
@@ -598,6 +628,8 @@ CREATE TABLE tbl_baja_animal (
 -- ════════════════════════════════════════════════════════════════════════════
 --  BLOQUE 12: GESTIÓN DE INSUMOS
 -- ════════════════════════════════════════════════════════════════════════════
+SET FOREIGN_KEY_CHECKS = 0;
+SET FOREIGN_KEY_CHECKS = 1;
 
 CREATE TABLE tbl_categoria_insumo (
     id_categoria_insumo INT AUTO_INCREMENT PRIMARY KEY,
@@ -607,6 +639,7 @@ CREATE TABLE tbl_categoria_insumo (
     fecha_creacion      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB COMMENT='Categorías de insumos (concentrado, forraje, medicina, etc.)';
 
+drop table tbl_insumo; 
 CREATE TABLE tbl_insumo (
     id_insumo           INT AUTO_INCREMENT PRIMARY KEY,
     id_categoria_insumo INT NOT NULL,
@@ -623,7 +656,9 @@ CREATE TABLE tbl_insumo (
     INDEX idx_insumo_activo (activo)
 ) ENGINE=InnoDB COMMENT='Catálogo de insumos (concentrado, heno, sal, etc.)';
 
+
 -- Movimientos de inventario (compras, ventas, consumo, producción)
+drop table tbl_movimiento_insumo; 
 CREATE TABLE tbl_movimiento_insumo (
     id_mov_insumo   BIGINT AUTO_INCREMENT PRIMARY KEY,
     id_insumo       INT    NOT NULL,
@@ -648,6 +683,7 @@ CREATE TABLE tbl_movimiento_insumo (
     INDEX idx_movins_tipo  (tipo_movimiento)
 ) ENGINE=InnoDB COMMENT='Kardex de entradas y salidas de insumos';
 
+drop table tbl_produccion_concentrado_det; 
 -- Detalle para producción de concentrado
 CREATE TABLE tbl_produccion_concentrado_det (
     id_detalle     BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -663,7 +699,7 @@ CREATE TABLE tbl_produccion_concentrado_det (
 -- ════════════════════════════════════════════════════════════════════════════
 --  BLOQUE 13: CONTABILIDAD / FINANZAS
 -- ════════════════════════════════════════════════════════════════════════════
-
+drop table tbl_transaccion_financiera; 
 CREATE TABLE tbl_transaccion_financiera (
     id_transaccion     BIGINT AUTO_INCREMENT PRIMARY KEY,
     categoria          ENUM('ingreso','gasto') NOT NULL,
