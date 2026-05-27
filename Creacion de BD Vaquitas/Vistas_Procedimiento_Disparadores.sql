@@ -175,6 +175,60 @@ END$$
 
 DELIMITER ;
 
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- T12 Reproducción Automatización de ciclos reproductivos
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DELIMITER $$
+CREATE TRIGGER trg_ciclo_estado_vaca_y_alertas
+AFTER UPDATE ON tbl_ciclo_reproductivo
+FOR EACH ROW
+BEGIN
+    -- Detectar cambio de fase en el ciclo
+    IF OLD.estado_ciclo <> NEW.estado_ciclo THEN
+        
+        -- A) Sincronizar tabla tbl_vaca_detalle (estado reproductivo actual)
+        IF NEW.estado_ciclo IN ('Preñez Provisional', 'Preñez Confirmada') THEN
+            UPDATE tbl_vaca_detalle SET estado_reproductivo = 'Preñada' 
+            WHERE id_animal = NEW.id_animal AND es_vigente = TRUE;
+        ELSEIF NEW.estado_ciclo IN ('Vacía', 'Parto Exitoso', 'Abortado') THEN
+            UPDATE tbl_vaca_detalle SET estado_reproductivo = 'Vacía' 
+            WHERE id_animal = NEW.id_animal AND es_vigente = TRUE;
+        END IF;
+        
+        -- B) Completar Alertas pendientes asociadas a la fase que se acaba de superar
+        IF NEW.estado_ciclo IN ('Preñez Provisional', 'Vacía') AND OLD.estado_ciclo = 'Pendiente Palpación 1' THEN
+            UPDATE tbl_alerta_reproductiva SET estado_alerta = 'Completada' 
+            WHERE id_ciclo = NEW.id_ciclo AND tipo_alerta = 'Palpación 1' AND estado_alerta = 'Pendiente';
+        END IF;
+        
+        IF NEW.estado_ciclo IN ('Preñez Confirmada', 'Vacía') AND OLD.estado_ciclo = 'Preñez Provisional' THEN
+            UPDATE tbl_alerta_reproductiva SET estado_alerta = 'Completada' 
+            WHERE id_ciclo = NEW.id_ciclo AND tipo_alerta = 'Palpación 2' AND estado_alerta = 'Pendiente';
+        END IF;
+        
+        IF NEW.estado_ciclo IN ('Parto Exitoso', 'Abortado') AND OLD.estado_ciclo = 'Preñez Confirmada' THEN
+            UPDATE tbl_alerta_reproductiva SET estado_alerta = 'Completada' 
+            WHERE id_ciclo = NEW.id_ciclo AND tipo_alerta = 'Parto Estimado' AND estado_alerta = 'Pendiente';
+        END IF;
+        
+    END IF;
+END$$
+DELIMITER ;
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- T13 Trigger para "devolver" a la vaca a su estado normal:
+-- ════════════════════════════════════════════════════════════════════════════
+DELIMITER $$
+CREATE TRIGGER trg_ciclo_borrar_vaca
+AFTER DELETE ON tbl_ciclo_reproductivo
+FOR EACH ROW
+BEGIN
+    -- Si borramos un ciclo por error, asegurarnos de que la vaca vuelva a estado 'Vacía'
+    UPDATE tbl_vaca_detalle SET estado_reproductivo = 'Vacía' 
+    WHERE id_animal = OLD.id_animal AND es_vigente = TRUE;
+END$$
+DELIMITER ;
+
 -- ════════════════════════════════════════════════════════════════════════════
 --  BLOQUE 17: STORED PROCEDURES
 -- ════════════════════════════════════════════════════════════════════════════
@@ -341,6 +395,636 @@ END$$
 
 DELIMITER ;
 
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- STORED PROCEDURES Reproducción (Controladores de Estado)
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DELIMITER $$
+-- 01 | Iniciar Ciclo
+CREATE PROCEDURE sp_iniciar_ciclo(
+    IN p_id_animal INT,
+    IN p_fecha_inicio DATE,
+    IN p_tipo_evento VARCHAR(50),
+    IN p_id_veterinario INT
+)
+BEGIN
+    DECLARE v_activos INT;
+    DECLARE v_id_ciclo INT;
+    
+    -- Validar que la vaca no tenga un ciclo ya en curso
+    SELECT COUNT(*) INTO v_activos FROM tbl_ciclo_reproductivo 
+    WHERE id_animal = p_id_animal 
+    AND estado_ciclo NOT IN ('Parto Exitoso', 'Abortado', 'Vacía');
+    
+    IF v_activos > 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La vaca ya tiene un ciclo reproductivo activo.';
+    END IF;
+    
+    INSERT INTO tbl_ciclo_reproductivo (
+        id_animal, fecha_inicio, tipo_evento, id_veterinario_inicio,
+        fecha_estimada_palp1, fecha_estimada_palp2, fecha_estimada_parto,
+        estado_ciclo
+    ) VALUES (
+        p_id_animal, p_fecha_inicio, p_tipo_evento, p_id_veterinario,
+        DATE_ADD(p_fecha_inicio, INTERVAL 30 DAY),
+        DATE_ADD(p_fecha_inicio, INTERVAL 60 DAY),
+        DATE_ADD(p_fecha_inicio, INTERVAL 283 DAY),
+        'Pendiente Palpación 1'
+    );
+    
+    SET v_id_ciclo = LAST_INSERT_ID();
+    
+    -- Crear Alerta 1
+    INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+    VALUES (v_id_ciclo, p_id_animal, 'Palpación 1', DATE_ADD(p_fecha_inicio, INTERVAL 30 DAY));
+END$$
+-- 02 | Registrar Palpación 1
+CREATE PROCEDURE sp_registrar_palpacion1(
+    IN p_id_ciclo INT,
+    IN p_fecha_palpacion DATE,
+    IN p_resultado VARCHAR(20),
+    IN p_id_veterinario INT
+)
+BEGIN
+    DECLARE v_estado_actual VARCHAR(50);
+    DECLARE v_id_animal INT;
+    
+    SELECT estado_ciclo, id_animal INTO v_estado_actual, v_id_animal 
+    FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo FOR UPDATE;
+    
+    IF v_estado_actual != 'Pendiente Palpación 1' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El ciclo debe estar en "Pendiente Palpación 1" para realizar esta acción.';
+    END IF;
+    
+    IF p_resultado = 'Preñada' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET fecha_palpacion1 = p_fecha_palpacion, resultado_palpacion1 = p_resultado,
+            id_veterinario_palp1 = p_id_veterinario, estado_ciclo = 'Preñez Provisional'
+        WHERE id_ciclo = p_id_ciclo;
+        
+        -- Alerta 2 (Palpación 2)
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        SELECT id_ciclo, id_animal, 'Palpación 2', fecha_estimada_palp2 
+        FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo;
+        
+    ELSEIF p_resultado = 'Vacía' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET fecha_palpacion1 = p_fecha_palpacion, resultado_palpacion1 = p_resultado,
+            id_veterinario_palp1 = p_id_veterinario, estado_ciclo = 'Vacía'
+        WHERE id_ciclo = p_id_ciclo;
+        
+        -- Alerta Celo (+21 días de hoy)
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        VALUES (p_id_ciclo, v_id_animal, 'Seguimiento de Celo', DATE_ADD(CURDATE(), INTERVAL 21 DAY));
+    ELSE
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Resultado inválido. Utilice "Preñada" o "Vacía".';
+    END IF;
+END$$
+-- RF-03 | Registrar Palpación 2
+CREATE PROCEDURE sp_registrar_palpacion2(
+    IN p_id_ciclo INT,
+    IN p_fecha_palpacion DATE,
+    IN p_resultado VARCHAR(20),
+    IN p_id_veterinario INT
+)
+BEGIN
+    DECLARE v_estado_actual VARCHAR(50);
+    DECLARE v_id_animal INT;
+    
+    SELECT estado_ciclo, id_animal INTO v_estado_actual, v_id_animal 
+    FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo FOR UPDATE;
+    
+    IF v_estado_actual != 'Preñez Provisional' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El ciclo debe estar en "Preñez Provisional" para registrar Palpación 2.';
+    END IF;
+    
+    IF p_resultado = 'Preñada' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET fecha_palpacion2 = p_fecha_palpacion, resultado_palpacion2 = p_resultado,
+            id_veterinario_palp2 = p_id_veterinario, estado_ciclo = 'Preñez Confirmada'
+        WHERE id_ciclo = p_id_ciclo;
+        
+        -- Alerta Parto
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        SELECT id_ciclo, id_animal, 'Parto Estimado', fecha_estimada_parto 
+        FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo;
+        
+    ELSEIF p_resultado = 'Vacía' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET fecha_palpacion2 = p_fecha_palpacion, resultado_palpacion2 = p_resultado,
+            id_veterinario_palp2 = p_id_veterinario, estado_ciclo = 'Vacía'
+        WHERE id_ciclo = p_id_ciclo;
+        
+        -- Alerta Celo
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        VALUES (p_id_ciclo, v_id_animal, 'Seguimiento de Celo', DATE_ADD(CURDATE(), INTERVAL 21 DAY));
+    ELSE
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Resultado inválido. Utilice "Preñada" o "Vacía".';
+    END IF;
+END$$
+-- 04 | Registrar Parto
+CREATE PROCEDURE sp_registrar_parto(
+    IN p_id_ciclo INT,
+    IN p_fecha_parto DATE,
+    IN p_resultado VARCHAR(20),
+    IN p_id_veterinario INT
+)
+BEGIN
+    DECLARE v_estado_actual VARCHAR(50);
+    DECLARE v_id_animal INT;
+    
+    SELECT estado_ciclo, id_animal INTO v_estado_actual, v_id_animal 
+    FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo FOR UPDATE;
+    
+    IF v_estado_actual != 'Preñez Confirmada' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'El ciclo debe estar en "Preñez Confirmada" para registrar un parto.';
+    END IF;
+    
+    IF p_resultado = 'Exitoso' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET fecha_parto_real = p_fecha_parto, resultado_parto = p_resultado,
+            id_veterinario_parto = p_id_veterinario, estado_ciclo = 'Parto Exitoso'
+        WHERE id_ciclo = p_id_ciclo;
+        
+        -- Aquí la aplicación debería llamar luego a sp_promover_ternero()
+        
+    ELSEIF p_resultado = 'Abortado' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET fecha_parto_real = p_fecha_parto, resultado_parto = p_resultado,
+            id_veterinario_parto = p_id_veterinario, estado_ciclo = 'Abortado'
+        WHERE id_ciclo = p_id_ciclo;
+        
+        -- Alerta Celo
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        VALUES (p_id_ciclo, v_id_animal, 'Seguimiento de Celo', DATE_ADD(CURDATE(), INTERVAL 21 DAY));
+    ELSE
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Resultado inválido. Utilice "Exitoso" o "Abortado".';
+    END IF;
+END$$
+DELIMITER ;
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+-- Reproducción: PROCEDIMIENTOS ALMACENADOS DE EDICIÓN
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DELIMITER $$
+-- ────────────────────────────────────────────────────────────────────────
+-- SP: Editar Fase 1 (Servicio / Día 0)
+-- ────────────────────────────────────────────────────────────────────────
+CREATE PROCEDURE sp_editar_servicio(
+    IN p_id_ciclo INT,
+    IN p_id_usuario INT,
+    IN p_fecha_inicio DATE,
+    IN p_tipo_evento VARCHAR(50),
+    IN p_id_toro_semental INT,
+    IN p_numero_pajilla VARCHAR(50),
+    IN p_id_raza_semen INT,
+    IN p_id_veterinario_inicio INT,
+    IN p_observaciones TEXT
+)
+BEGIN
+    DECLARE v_estado_ciclo VARCHAR(50);
+    DECLARE v_fecha_inicio_ant DATE;
+    DECLARE v_tipo_evento_ant VARCHAR(50);
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION 
+    BEGIN
+        ROLLBACK;
+        SELECT JSON_OBJECT('exito', false, 'mensaje', 'Error interno en la base de datos al editar el servicio.') AS resultado;
+    END;
+    START TRANSACTION;
+    
+    SELECT estado_ciclo, fecha_inicio, tipo_evento 
+    INTO v_estado_ciclo, v_fecha_inicio_ant, v_tipo_evento_ant
+    FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo FOR UPDATE;
+    
+    IF v_estado_ciclo != 'Pendiente Palpación 1' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Solo se puede editar el servicio si el ciclo está en Pendiente Palpación 1.';
+    END IF;
+    
+    IF p_fecha_inicio > CURDATE() THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La fecha de inicio no puede ser futura.';
+    END IF;
+    -- Actualizar tabla principal y recalcular fechas
+    UPDATE tbl_ciclo_reproductivo
+    SET fecha_inicio = p_fecha_inicio,
+        tipo_evento = p_tipo_evento,
+        id_veterinario_inicio = p_id_veterinario_inicio,
+        fecha_estimada_palp1 = DATE_ADD(p_fecha_inicio, INTERVAL 30 DAY),
+        fecha_estimada_palp2 = DATE_ADD(p_fecha_inicio, INTERVAL 60 DAY),
+        fecha_estimada_parto = DATE_ADD(p_fecha_inicio, INTERVAL 283 DAY)
+    WHERE id_ciclo = p_id_ciclo;
+    -- Actualizar alerta de Palpación 1
+    IF v_fecha_inicio_ant != p_fecha_inicio THEN
+        UPDATE tbl_alerta_reproductiva 
+        SET fecha_programada = DATE_ADD(p_fecha_inicio, INTERVAL 30 DAY)
+        WHERE id_ciclo = p_id_ciclo AND tipo_alerta = 'Palpación 1' AND estado_alerta = 'Pendiente';
+        
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo, genero_cascada, descripcion_cascada)
+        VALUES (p_id_ciclo, p_id_usuario, 'Servicio', 'fecha_inicio', v_fecha_inicio_ant, p_fecha_inicio, 1, 'Se recalcularon las fechas estimadas de palpación y parto, y se reprogramó la alerta de Palpación 1.');
+    END IF;
+    IF v_tipo_evento_ant != p_tipo_evento THEN
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo)
+        VALUES (p_id_ciclo, p_id_usuario, 'Servicio', 'tipo_evento', v_tipo_evento_ant, p_tipo_evento);
+    END IF;
+    COMMIT;
+    SELECT JSON_OBJECT('exito', true, 'mensaje', 'Servicio actualizado correctamente.', 'cascada_ejecutada', IF(v_fecha_inicio_ant != p_fecha_inicio, true, false)) AS resultado;
+END$$
+-- ────────────────────────────────────────────────────────────────────────
+-- SP: Editar Fase 2 (Palpación 1)
+-- ────────────────────────────────────────────────────────────────────────
+CREATE PROCEDURE sp_editar_palpacion1(
+    IN p_id_ciclo INT,
+    IN p_id_usuario INT,
+    IN p_fecha_palpacion1 DATE,
+    IN p_resultado_palpacion1 VARCHAR(20),
+    IN p_id_veterinario_palp1 INT,
+    IN p_observaciones_palp1 TEXT
+)
+BEGIN
+    DECLARE v_estado_ciclo VARCHAR(50);
+    DECLARE v_fecha_inicio DATE;
+    DECLARE v_res_ant VARCHAR(20);
+    DECLARE v_fecha_ant DATE;
+    DECLARE v_id_animal INT;
+    DECLARE v_desc_cascada TEXT;
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION 
+    BEGIN
+        ROLLBACK;
+        SELECT JSON_OBJECT('exito', false, 'mensaje', 'Error en la transacción al editar Palpación 1.') AS resultado;
+    END;
+    START TRANSACTION;
+    
+    SELECT estado_ciclo, fecha_inicio, resultado_palpacion1, fecha_palpacion1, id_animal 
+    INTO v_estado_ciclo, v_fecha_inicio, v_res_ant, v_fecha_ant, v_id_animal
+    FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo FOR UPDATE;
+    
+    IF v_estado_ciclo != 'Preñez Provisional' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Solo se puede editar Palpación 1 si el ciclo está en Preñez Provisional.';
+    END IF;
+    
+    IF p_fecha_palpacion1 < v_fecha_inicio OR p_fecha_palpacion1 > CURDATE() THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Fecha de palpación inválida (debe ser posterior al servicio y no futura).';
+    END IF;
+    -- Si cambió de Preñada a Vacía (Cascada Mayor)
+    IF v_res_ant = 'Preñada' AND p_resultado_palpacion1 = 'Vacía' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET resultado_palpacion1 = p_resultado_palpacion1, fecha_palpacion1 = p_fecha_palpacion1, id_veterinario_palp1 = p_id_veterinario_palp1, estado_ciclo = 'Vacía'
+        WHERE id_ciclo = p_id_ciclo;
+        -- Cancelar alertas futuras
+        UPDATE tbl_alerta_reproductiva SET estado_alerta = 'Cancelada' 
+        WHERE id_ciclo = p_id_ciclo AND tipo_alerta IN ('Palpación 2', 'Parto Estimado') AND estado_alerta = 'Pendiente';
+        
+        -- Nueva alerta de celo
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        VALUES (p_id_ciclo, v_id_animal, 'Seguimiento de Celo', DATE_ADD(CURDATE(), INTERVAL 21 DAY));
+        
+        -- Actualizar vaca
+        UPDATE tbl_vaca_detalle SET estado_reproductivo = 'Vacía' WHERE id_animal = v_id_animal AND es_vigente = TRUE;
+        
+        SET v_desc_cascada = 'Cambio de estado a Vacía. Se cancelaron alertas futuras y se creó Seguimiento de Celo. Vaca marcada como Vacía.';
+        
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo, genero_cascada, descripcion_cascada)
+        VALUES (p_id_ciclo, p_id_usuario, 'Palpación 1', 'resultado_palpacion1', v_res_ant, p_resultado_palpacion1, 1, v_desc_cascada);
+        
+    -- Si no cambia el resultado, pero cambia la fecha
+    ELSEIF p_fecha_palpacion1 != v_fecha_ant THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET fecha_palpacion1 = p_fecha_palpacion1, id_veterinario_palp1 = p_id_veterinario_palp1, fecha_estimada_palp2 = DATE_ADD(p_fecha_palpacion1, INTERVAL 30 DAY)
+        WHERE id_ciclo = p_id_ciclo;
+        
+        -- Actualizar alerta Palpación 2
+        UPDATE tbl_alerta_reproductiva SET fecha_programada = DATE_ADD(p_fecha_palpacion1, INTERVAL 30 DAY)
+        WHERE id_ciclo = p_id_ciclo AND tipo_alerta = 'Palpación 2' AND estado_alerta = 'Pendiente';
+        
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo, genero_cascada, descripcion_cascada)
+        VALUES (p_id_ciclo, p_id_usuario, 'Palpación 1', 'fecha_palpacion1', v_fecha_ant, p_fecha_palpacion1, 1, 'Se reprogramó la alerta de Palpación 2 basada en la nueva fecha de Palpación 1.');
+    ELSE
+        -- Solo detalles menores
+        UPDATE tbl_ciclo_reproductivo SET id_veterinario_palp1 = p_id_veterinario_palp1 WHERE id_ciclo = p_id_ciclo;
+    END IF;
+    COMMIT;
+    SELECT JSON_OBJECT('exito', true, 'mensaje', 'Palpación 1 editada.', 'cascada_ejecutada', IF(v_res_ant != p_resultado_palpacion1, true, false)) AS resultado;
+END$$
+-- ────────────────────────────────────────────────────────────────────────
+-- SP: Editar Fase 3 (Palpación 2)
+-- ────────────────────────────────────────────────────────────────────────
+CREATE PROCEDURE sp_editar_palpacion2(
+    IN p_id_ciclo INT,
+    IN p_id_usuario INT,
+    IN p_fecha_palpacion2 DATE,
+    IN p_resultado_palpacion2 VARCHAR(20),
+    IN p_id_veterinario_palp2 INT,
+    IN p_observaciones_palp2 TEXT
+)
+BEGIN
+    DECLARE v_estado_ciclo VARCHAR(50);
+    DECLARE v_fecha_palp1 DATE;
+    DECLARE v_res_ant VARCHAR(20);
+    DECLARE v_fecha_ant DATE;
+    DECLARE v_id_animal INT;
+    DECLARE v_desc_cascada TEXT;
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION 
+    BEGIN
+        ROLLBACK;
+        SELECT JSON_OBJECT('exito', false, 'mensaje', 'Error en la transacción al editar Palpación 2.') AS resultado;
+    END;
+    START TRANSACTION;
+    
+    SELECT estado_ciclo, fecha_palpacion1, resultado_palpacion2, fecha_palpacion2, id_animal 
+    INTO v_estado_ciclo, v_fecha_palp1, v_res_ant, v_fecha_ant, v_id_animal
+    FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo FOR UPDATE;
+    
+    IF v_estado_ciclo != 'Preñez Confirmada' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Solo se puede editar Palpación 2 si el ciclo está en Preñez Confirmada.';
+    END IF;
+    
+    IF p_fecha_palpacion2 < v_fecha_palp1 OR p_fecha_palpacion2 > CURDATE() THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La fecha debe ser posterior a la Palpación 1 y no futura.';
+    END IF;
+    IF v_res_ant = 'Preñada' AND p_resultado_palpacion2 = 'Vacía' THEN
+        UPDATE tbl_ciclo_reproductivo 
+        SET resultado_palpacion2 = p_resultado_palpacion2, fecha_palpacion2 = p_fecha_palpacion2, estado_ciclo = 'Vacía'
+        WHERE id_ciclo = p_id_ciclo;
+        UPDATE tbl_alerta_reproductiva SET estado_alerta = 'Cancelada' 
+        WHERE id_ciclo = p_id_ciclo AND tipo_alerta = 'Parto Estimado' AND estado_alerta = 'Pendiente';
+        
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        VALUES (p_id_ciclo, v_id_animal, 'Seguimiento de Celo', DATE_ADD(CURDATE(), INTERVAL 21 DAY));
+        
+        UPDATE tbl_vaca_detalle SET estado_reproductivo = 'Vacía' WHERE id_animal = v_id_animal AND es_vigente = TRUE;
+        
+        SET v_desc_cascada = 'Cambio de estado a Vacía. Se canceló alerta Parto Estimado y creó Seguimiento de Celo.';
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo, genero_cascada, descripcion_cascada)
+        VALUES (p_id_ciclo, p_id_usuario, 'Palpación 2', 'resultado_palpacion2', v_res_ant, p_resultado_palpacion2, 1, v_desc_cascada);
+        
+    ELSEIF p_fecha_palpacion2 != v_fecha_ant THEN
+        UPDATE tbl_ciclo_reproductivo SET fecha_palpacion2 = p_fecha_palpacion2 WHERE id_ciclo = p_id_ciclo;
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo)
+        VALUES (p_id_ciclo, p_id_usuario, 'Palpación 2', 'fecha_palpacion2', v_fecha_ant, p_fecha_palpacion2);
+    END IF;
+    COMMIT;
+    SELECT JSON_OBJECT('exito', true, 'mensaje', 'Palpación 2 editada.') AS resultado;
+END$$
+-- ────────────────────────────────────────────────────────────────────────
+-- SP: Editar Fase 4 (Parto)
+-- ────────────────────────────────────────────────────────────────────────
+CREATE PROCEDURE sp_editar_parto(
+    IN p_id_ciclo INT,
+    IN p_id_usuario INT,
+    IN p_fecha_parto_real DATE,
+    IN p_resultado_parto VARCHAR(20),
+    IN p_id_veterinario_parto INT,
+    IN p_observaciones_parto TEXT
+)
+BEGIN
+    DECLARE v_estado_ciclo VARCHAR(50);
+    DECLARE v_fecha_palp2 DATE;
+    DECLARE v_res_ant VARCHAR(20);
+    DECLARE v_id_animal INT;
+    DECLARE v_desc_cascada TEXT;
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION 
+    BEGIN
+        ROLLBACK;
+        SELECT JSON_OBJECT('exito', false, 'mensaje', 'Error en transacción al editar Parto.') AS resultado;
+    END;
+    START TRANSACTION;
+    
+    SELECT estado_ciclo, fecha_palpacion2, resultado_parto, id_animal 
+    INTO v_estado_ciclo, v_fecha_palp2, v_res_ant, v_id_animal
+    FROM tbl_ciclo_reproductivo WHERE id_ciclo = p_id_ciclo FOR UPDATE;
+    
+    IF v_estado_ciclo NOT IN ('Parto Exitoso', 'Abortado') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Solo se edita el parto si el ciclo ya finalizó.';
+    END IF;
+    
+    IF p_fecha_parto_real < v_fecha_palp2 OR p_fecha_parto_real > CURDATE() THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Fecha de parto no puede ser anterior a Palpación 2 ni futura.';
+    END IF;
+    IF v_res_ant = 'Exitoso' AND p_resultado_parto = 'Abortado' THEN
+        UPDATE tbl_ciclo_reproductivo SET resultado_parto = p_resultado_parto, estado_ciclo = 'Abortado' WHERE id_ciclo = p_id_ciclo;
+        
+        -- Alerta de Celo por aborto
+        INSERT INTO tbl_alerta_reproductiva (id_ciclo, id_animal, tipo_alerta, fecha_programada)
+        VALUES (p_id_ciclo, v_id_animal, 'Seguimiento de Celo', DATE_ADD(p_fecha_parto_real, INTERVAL 21 DAY));
+        
+        SET v_desc_cascada = 'Cambio a Abortado. Requiere eliminar cría manualmente. Generada alerta de Celo.';
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo, genero_cascada, descripcion_cascada)
+        VALUES (p_id_ciclo, p_id_usuario, 'Parto', 'resultado_parto', v_res_ant, p_resultado_parto, 1, v_desc_cascada);
+        
+    ELSEIF v_res_ant = 'Abortado' AND p_resultado_parto = 'Exitoso' THEN
+        UPDATE tbl_ciclo_reproductivo SET resultado_parto = p_resultado_parto, estado_ciclo = 'Parto Exitoso' WHERE id_ciclo = p_id_ciclo;
+        
+        -- Eliminar alerta de celo generada por error
+        UPDATE tbl_alerta_reproductiva SET estado_alerta = 'Cancelada' WHERE id_ciclo = p_id_ciclo AND tipo_alerta = 'Seguimiento de Celo' AND estado_alerta = 'Pendiente';
+        
+        SET v_desc_cascada = 'Cambio a Exitoso. Alerta de Celo cancelada. Ejecutar registro de cría manualmente.';
+        INSERT INTO tbl_auditoria_ciclo (id_ciclo, id_usuario, fase_editada, campo_modificado, valor_anterior, valor_nuevo, genero_cascada, descripcion_cascada)
+        VALUES (p_id_ciclo, p_id_usuario, 'Parto', 'resultado_parto', v_res_ant, p_resultado_parto, 1, v_desc_cascada);
+    END IF;
+    COMMIT;
+    SELECT JSON_OBJECT('exito', true, 'mensaje', 'Parto editado.') AS resultado;
+END$$
+DELIMITER ;
+
+-- =================================================================================
+-- MÓDULO SANITARIO: PROCEDIMIENTOS ALMACENADOS Y TRIGGERS DE AUTOMATIZACIÓN
+-- =================================================================================
+
+DELIMITER $$
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- 1. SP: REGISTRO DE SANIDAD INDIVIDUAL (O MÚLTIPLE MANUAL)
+-- Permite guardar la cabecera, detalles por vaca, cronograma futuro y datos de 
+-- mastitis en una sola transacción pasando Arrays de JSON desde PHP.
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CREATE PROCEDURE sp_registrar_sanidad_individual(
+    IN p_categoria VARCHAR(50),
+    IN p_sub_tipo VARCHAR(80),
+    IN p_proposito VARCHAR(50),
+    IN p_id_producto INT,
+    IN p_dosis_valor DECIMAL(8,2),
+    IN p_dosis_unidad VARCHAR(20),
+    IN p_fecha_aplicacion DATE,
+    IN p_repeticion VARCHAR(50),
+    IN p_intervalo_dias INT,
+    IN p_duracion_dias INT,
+    IN p_id_causa INT,
+    IN p_notas TEXT,
+    IN p_id_veterinario INT,
+    IN p_id_usuario INT,
+    
+    -- JSON Arrays enviados desde JS -> PHP
+    IN p_animales_json JSON,     -- Ej: [41, 42, 89]
+    IN p_cronograma_json JSON,   -- Ej: ["2026-06-01", "2026-06-08"]
+    IN p_mastitis_json JSON      -- Ej: [{"id_animal": 41, "ad": "Sana", "pd": "Leve", "ai": "Sana", "pi": "Sana"}]
+)
+BEGIN
+    DECLARE v_id_registro BIGINT;
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION 
+    BEGIN
+        ROLLBACK;
+        SELECT JSON_OBJECT('exito', false, 'mensaje', 'Error en la base de datos al registrar el tratamiento.') AS resultado;
+    END;
+    START TRANSACTION;
+    -- 1. Insertar Cabecera
+    INSERT INTO tbl_registro_sanitario (
+        tipo_aplicacion, categoria, sub_tipo, proposito, id_producto,
+        dosis_valor, dosis_unidad, fecha_aplicacion, repeticion, 
+        intervalo_dias, duracion_dias, id_causa, notas, id_veterinario, id_usuario
+    ) VALUES (
+        'Individual', p_categoria, p_sub_tipo, p_proposito, p_id_producto,
+        p_dosis_valor, p_dosis_unidad, p_fecha_aplicacion, COALESCE(p_repeticion, 'Única'),
+        p_intervalo_dias, p_duracion_dias, p_id_causa, p_notas, p_id_veterinario, p_id_usuario
+    );
+    
+    SET v_id_registro = LAST_INSERT_ID();
+    -- 2. Insertar Detalle de Animales Afectados (Desempaquetando el JSON)
+    INSERT INTO tbl_registro_sanitario_animal (id_registro_san, id_animal, estado_aplicacion, fecha_real_aplicacion)
+    SELECT v_id_registro, animal_id, 'Aplicado', NOW()
+    FROM JSON_TABLE(p_animales_json, '$[*]' COLUMNS(animal_id INT PATH '$')) AS jt;
+    
+    -- 3. Insertar Cronograma de futuras dosis (Si aplica)
+    IF p_cronograma_json IS NOT NULL AND JSON_LENGTH(p_cronograma_json) > 0 THEN
+        -- Crear el calendario interno del módulo sanitario
+        INSERT INTO tbl_programacion_sanitaria (id_registro_san, fecha_programada, estado)
+        SELECT v_id_registro, fecha_prog, 'Pendiente'
+        FROM JSON_TABLE(p_cronograma_json, '$[*]' COLUMNS(fecha_prog DATE PATH '$')) AS jt;
+        
+        -- Crear las notificaciones globales en la tabla de alertas maestras
+        INSERT INTO tbl_alerta (modulo, id_animal, tipo, descripcion, prioridad, fecha_programada)
+        SELECT 'Sanidad', ja.animal_id, CONCAT('Próxima dosis: ', p_categoria), 
+               CONCAT('Requiere aplicación programada de ', COALESCE(p_sub_tipo, 'tratamiento')), 
+               'Normal', jc.fecha_prog
+        FROM JSON_TABLE(p_animales_json, '$[*]' COLUMNS(animal_id INT PATH '$')) AS ja
+        CROSS JOIN JSON_TABLE(p_cronograma_json, '$[*]' COLUMNS(fecha_prog DATE PATH '$')) AS jc;
+    END IF;
+    
+    -- 4. Insertar Detalle Mastitis por cuartos (Si la categoría es Mastitis)
+    IF p_categoria = 'Mastitis' AND p_mastitis_json IS NOT NULL AND JSON_LENGTH(p_mastitis_json) > 0 THEN
+        INSERT INTO tbl_mastitis_cuartos (id_registro_san, id_animal, cuarto_ad, cuarto_pd, cuarto_ai, cuarto_pi, en_tratamiento)
+        SELECT v_id_registro, m_animal_id, m_ad, m_pd, m_ai, m_pi, TRUE
+        FROM JSON_TABLE(p_mastitis_json, '$[*]' COLUMNS(
+            m_animal_id INT PATH '$.id_animal',
+            m_ad VARCHAR(20) PATH '$.ad',
+            m_pd VARCHAR(20) PATH '$.pd',
+            m_ai VARCHAR(20) PATH '$.ai',
+            m_pi VARCHAR(20) PATH '$.pi'
+        )) AS jt;
+    END IF;
+    COMMIT;
+    
+    SELECT JSON_OBJECT('exito', true, 'mensaje', 'Registro sanitario individual creado correctamente.', 'id_registro', v_id_registro) AS resultado;
+END$$
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- 2. SP: REGISTRO DE SANIDAD MASIVA (POR MANGA)
+-- Busca todas las vacas de la manga y hace la expansión automáticamente.
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CREATE PROCEDURE sp_registrar_sanidad_masiva(
+    IN p_id_manga INT,
+    IN p_categoria VARCHAR(50),
+    IN p_sub_tipo VARCHAR(80),
+    IN p_proposito VARCHAR(50),
+    IN p_id_producto INT,
+    IN p_dosis_valor DECIMAL(8,2),
+    IN p_dosis_unidad VARCHAR(20),
+    IN p_fecha_aplicacion DATE,
+    IN p_repeticion VARCHAR(50),
+    IN p_intervalo_dias INT,
+    IN p_duracion_dias INT,
+    IN p_id_causa INT,
+    IN p_notas TEXT,
+    IN p_id_veterinario INT,
+    IN p_id_usuario INT,
+    
+    -- JSON Array del cronograma enviado desde JS -> PHP
+    IN p_cronograma_json JSON
+)
+BEGIN
+    DECLARE v_id_registro BIGINT;
+    DECLARE v_vacas_afectadas INT;
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION 
+    BEGIN
+        ROLLBACK;
+        SELECT JSON_OBJECT('exito', false, 'mensaje', 'Error en la base de datos al registrar sanidad masiva.') AS resultado;
+    END;
+    START TRANSACTION;
+    SELECT COUNT(*) INTO v_vacas_afectadas 
+    FROM tbl_animal 
+    WHERE id_manga_actual = p_id_manga AND estado_animal = 'Activo';
+    IF v_vacas_afectadas = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'La manga seleccionada está vacía o no tiene animales activos.';
+    END IF;
+    -- 1. Insertar Cabecera (Tipo: Masivo)
+    INSERT INTO tbl_registro_sanitario (
+        tipo_aplicacion, categoria, sub_tipo, proposito, id_producto,
+        dosis_valor, dosis_unidad, fecha_aplicacion, repeticion, 
+        intervalo_dias, duracion_dias, id_causa, notas, id_veterinario, id_usuario
+    ) VALUES (
+        'Masivo', p_categoria, p_sub_tipo, p_proposito, p_id_producto,
+        p_dosis_valor, p_dosis_unidad, p_fecha_aplicacion, COALESCE(p_repeticion, 'Única'),
+        p_intervalo_dias, p_duracion_dias, p_id_causa, p_notas, p_id_veterinario, p_id_usuario
+    );
+    
+    SET v_id_registro = LAST_INSERT_ID();
+    -- 2. Insertar Detalle (Expansión Masiva)
+    INSERT INTO tbl_registro_sanitario_animal (id_registro_san, id_animal, estado_aplicacion, fecha_real_aplicacion)
+    SELECT v_id_registro, id_animal, 'Aplicado', NOW()
+    FROM tbl_animal
+    WHERE id_manga_actual = p_id_manga AND estado_animal = 'Activo';
+    
+    -- 3. Insertar Cronograma y Alertas Globales (Si aplica)
+    IF p_cronograma_json IS NOT NULL AND JSON_LENGTH(p_cronograma_json) > 0 THEN
+        -- Crear el calendario
+        INSERT INTO tbl_programacion_sanitaria (id_registro_san, fecha_programada, estado)
+        SELECT v_id_registro, fecha_prog, 'Pendiente'
+        FROM JSON_TABLE(p_cronograma_json, '$[*]' COLUMNS(fecha_prog DATE PATH '$')) AS jt;
+        
+        -- Crear notificaciones globales
+        INSERT INTO tbl_alerta (modulo, id_animal, tipo, descripcion, prioridad, fecha_programada)
+        SELECT 'Sanidad', a.id_animal, CONCAT('Próxima dosis: ', p_categoria), 
+               CONCAT('Aplicación masiva programada de ', COALESCE(p_sub_tipo, 'tratamiento')), 
+               'Normal', jc.fecha_prog
+        FROM tbl_animal a
+        CROSS JOIN JSON_TABLE(p_cronograma_json, '$[*]' COLUMNS(fecha_prog DATE PATH '$')) AS jc
+        WHERE a.id_manga_actual = p_id_manga AND a.estado_animal = 'Activo';
+    END IF;
+    COMMIT;
+    
+    SELECT JSON_OBJECT(
+        'exito', true, 
+        'mensaje', CONCAT('Tratamiento masivo registrado a ', v_vacas_afectadas, ' animales.'),
+        'animales_vacunados', v_vacas_afectadas,
+        'id_registro', v_id_registro
+    ) AS resultado;
+END$$
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- 3. TRIGGER: CIERRE AUTOMÁTICO DE ALERTAS GLOBALES
+-- Cuando el operario va al cronograma y marca una vacuna como "Aplicada", 
+-- el sistema apaga la campanita de notificaciones global.
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CREATE TRIGGER trg_sanidad_cierra_alerta
+AFTER UPDATE ON tbl_programacion_sanitaria
+FOR EACH ROW
+BEGIN
+    -- Si el estado cambia a 'Aplicado'
+    IF OLD.estado != 'Aplicado' AND NEW.estado = 'Aplicado' THEN
+        
+        -- Buscar todas las alertas globales atadas a este evento y esta fecha, y marcarlas como Atendidas
+        UPDATE tbl_alerta a
+        JOIN tbl_registro_sanitario_animal rsa ON a.id_animal = rsa.id_animal
+        SET a.estado = 'Atendida', a.fecha_atendida = NOW()
+        WHERE rsa.id_registro_san = NEW.id_registro_san
+          AND a.modulo = 'Sanidad'
+          AND DATE(a.fecha_programada) = DATE(NEW.fecha_programada)
+          AND a.estado = 'Pendiente';
+          
+    END IF;
+END$$
+DELIMITER ;
+
 -- ════════════════════════════════════════════════════════════════════════════
 --  BLOQUE 18: VISTAS
 -- ════════════════════════════════════════════════════════════════════════════
@@ -437,22 +1121,7 @@ LEFT JOIN tbl_usuario u ON al.id_usuario_atiende = u.id_usuario
 WHERE al.estado = 'Pendiente'
 ORDER BY FIELD(al.prioridad,'Urgente','Normal','Baja'), al.fecha_programada;
 
--- VW5: Historial reproductivo de vacas
-CREATE OR REPLACE VIEW vw_historial_reproductivo AS
-SELECT
-    a.arete,
-    a.id_animal,
-    er.tipo_evento,
-    er.fecha_evento,
-    er.resultado_palp,
-    er.fecha_estimada_parto,
-    er.estado_resultado,
-    CONCAT(c.causa_principal, IFNULL(CONCAT(' — ', c.detalle_causa),'')) AS causa,
-    er.observaciones
-FROM tbl_evento_reproductivo er
-JOIN tbl_animal a ON er.id_animal = a.id_animal
-LEFT JOIN tbl_causa c ON er.id_causa = c.id_causa
-ORDER BY er.id_animal, er.fecha_evento DESC;
+
 
 -- VW6: Mortalidad con causa y animal
 CREATE OR REPLACE VIEW vw_mortalidad AS
@@ -715,34 +1384,47 @@ LEFT JOIN tbl_programacion_sanitaria prog ON rs.id_registro_san = prog.id_regist
     AND prog.estado = 'Pendiente';
 
 -- VW10: Expediente Reproductivo de Animales
-CREATE OR REPLACE VIEW vw_expediente_reproductivo AS
+-- VISTA: KPIs Reproductivos en Tiempo Real (RF-06)
+CREATE OR REPLACE VIEW vw_kpi_reproductivo AS
 SELECT 
-    er.id_animal,
+    (SELECT COUNT(*) FROM tbl_ciclo_reproductivo WHERE estado_ciclo IN ('Preñez Provisional', 'Preñez Confirmada')) AS vacas_prenadas,
+    (SELECT COUNT(*) FROM tbl_ciclo_reproductivo WHERE resultado_parto IN ('Exitoso', 'Abortado') 
+        AND MONTH(fecha_parto_real) = MONTH(CURDATE()) 
+        AND YEAR(fecha_parto_real) = YEAR(CURDATE())) AS partos_del_mes,
+    ROUND(
+        (SELECT COUNT(*) FROM tbl_ciclo_reproductivo WHERE estado_ciclo = 'Parto Exitoso') 
+        / NULLIF((SELECT COUNT(*) FROM tbl_ciclo_reproductivo), 0) * 100
+    , 2) AS tasa_exito_pct;
+-- VISTA: Próximos Eventos y Alertas
+CREATE OR REPLACE VIEW vw_proximos_eventos AS
+SELECT 
+    ar.id_alerta,
     a.arete,
-    er.tipo_evento AS evento,
-    er.fecha_evento AS fecha,
-    -- Combinamos la fase, causa u observaciones para el campo Detalle / Tipo / Fase
-    TRIM(BOTH ' - ' FROM CONCAT_WS(' - ', 
-        er.fase_palpacion, 
-        c.detalle_causa, 
-        er.observaciones
-    )) AS detalle,
-    -- Se muestra el número de pajilla (IA) o el arete del semental (Monta)
-    COALESCE(er.numero_pajilla, toro.arete, '-') AS semental_pajilla,
-    -- Generamos un estado amigable para la interfaz basado en los resultados
-    CASE 
-        WHEN er.resultado_palp = 'Preñez confirmada' THEN 'Confirmada'
-        WHEN er.resultado_palp = 'Preñez provisional' THEN 'Provisional'
-        WHEN er.resultado_palp IS NOT NULL AND er.resultado_palp != 'Sin evaluar' THEN er.resultado_palp
-        WHEN er.tipo_evento = 'Parto' AND er.estado_resultado = 'Realizado' THEN 'Exitoso'
-        WHEN er.tipo_evento = 'Aborto' THEN 'Aborto'
-        ELSE er.estado_resultado 
-    END AS estado,
-    er.id_evento_rep
-FROM tbl_evento_reproductivo er
-JOIN tbl_animal a ON er.id_animal = a.id_animal
-LEFT JOIN tbl_animal toro ON er.id_toro = toro.id_animal
-LEFT JOIN tbl_causa c ON er.id_causa = c.id_causa;
+    ar.tipo_alerta,
+    ar.fecha_programada,
+    ar.estado_alerta,
+    DATEDIFF(ar.fecha_programada, CURDATE()) AS dias_restantes
+FROM tbl_alerta_reproductiva ar
+JOIN tbl_animal a ON ar.id_animal = a.id_animal
+WHERE ar.estado_alerta = 'Pendiente'
+ORDER BY ar.fecha_programada ASC;
+-- VISTA: Historial Clínico Reproductivo (Resumen de Fases)
+CREATE OR REPLACE VIEW vw_historial_reproductivo AS
+SELECT 
+    cr.id_ciclo,
+    a.arete,
+    cr.fecha_inicio,
+    cr.tipo_evento,
+    cr.estado_ciclo,
+    cr.fecha_palpacion1,
+    cr.resultado_palpacion1,
+    cr.fecha_palpacion2,
+    cr.resultado_palpacion2,
+    cr.fecha_parto_real,
+    cr.resultado_parto
+FROM tbl_ciclo_reproductivo cr
+JOIN tbl_animal a ON cr.id_animal = a.id_animal
+ORDER BY cr.fecha_inicio DESC;
 
 -- ╔══════════════════════════════════════════════════════════════════════════╗
 -- ║                     FIN DEL SCRIPT v3.0 — HOFLOC.SA                     ║

@@ -12,13 +12,11 @@
 -- ║  [C3] SELECT COUNT(*) de información_schema eliminado del script        ║
 -- ║  [C4] Todos los triggers, vistas y SPs añadidos en bloques separados    ║
 -- ╚══════════════════════════════════════════════════════════════════════════╝
-
 -- ════════════════════════════════════════════════════════════════════════════
 --  BLOQUE 0: CONFIGURACIÓN DEL ENTORNO
 --  Crea la base de datos, el usuario y asigna permisos.
 --  Ejecuta este bloque como root/admin antes de continuar.
 -- ════════════════════════════════════════════════════════════════════════════
-
 CREATE DATABASE IF NOT EXISTS BD_vaquitas
     DEFAULT CHARACTER SET utf8mb4
     DEFAULT COLLATE utf8mb4_unicode_ci;
@@ -168,10 +166,10 @@ CREATE TABLE tbl_animal (
     id_procedencia      INT NULL,
     id_raza             INT NOT NULL,                    -- ¡Faltaba declarar!
     id_manga_actual     INT NULL,                    -- ¡Faltaba declarar!
-    trazabilidad        VARCHAR(20) NOT NULL,        -- ¡Faltaba declarar!
+    trazabilidad        VARCHAR(20) NOT NULL UNIQUE, -- ¡Faltaba declarar!
     tipo_animal         ENUM('Vaca','Toro','Ternero') NOT NULL, -- ¡Faltaba declarar!
     sexo                ENUM('M','F') NOT NULL,      -- ¡Faltaba declarar!
-    arete               VARCHAR(50) NOT NULL,        -- ¡Faltaba declarar!
+    arete               VARCHAR(50) NOT NULL UNIQUE, -- ¡Faltaba declarar!
     fecha_nacimiento    DATE NOT NULL,
     fecha_ingreso       DATE NOT NULL DEFAULT (CURRENT_DATE),
     peso_actual_kg      DECIMAL(7,2) NULL,
@@ -495,48 +493,94 @@ CREATE TABLE tbl_programacion_sanitaria (
 )  ENGINE=INNODB COMMENT='Cronograma de aplicaciones sanitarias';
 
 -- ════════════════════════════════════════════════════════════════════════════
---  BLOQUE 9: REPRODUCCIÓN
+--  BLOQUE 9: REPRODUCCIÓN, TABLA : tbl_ciclo_reproductivo
 -- ════════════════════════════════════════════════════════════════════════════
 
-CREATE TABLE tbl_evento_reproductivo (
-    id_evento_rep        BIGINT AUTO_INCREMENT PRIMARY KEY,
-    id_animal            INT  NOT NULL,    -- vaca o hembra participante
-    tipo_evento          ENUM('Inseminación Artificial','Monta Natural','Palpación',
-                              'Celo','Parto','Aborto','Secado') NOT NULL,
-    fecha_evento         DATE NOT NULL,
-    hora_evento          TIME NULL,
-    -- IA
-    numero_pajilla       VARCHAR(40)  NULL,
-    raza_semen           VARCHAR(60)  NULL,
-    proveedor_semen      VARCHAR(120) NULL,
-    -- Monta Natural
-    id_toro              INT          NULL,
-    -- Palpación
-    fase_palpacion       ENUM('Fase 1','Fase 2') NULL,
-    resultado_palp       ENUM('Preñada','Vacía','Preñez provisional',
-                              'Preñez confirmada','Sin evaluar') NULL,
-    -- Resultado
-    estado_resultado     ENUM('Programado','Realizado','Cancelado') NOT NULL DEFAULT 'Realizado',
-    fecha_estimada_parto DATE         NULL,
-    id_causa             INT          NULL,   -- FK → tbl_causa (ej: aborto por...)
-    observaciones        TEXT         NULL,
-    id_veterinario       INT          NULL,
-    id_usuario           INT          NULL,
-    fecha_creacion       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_rep_animal     FOREIGN KEY (id_animal)
-        REFERENCES tbl_animal(id_animal) ON UPDATE CASCADE ON DELETE CASCADE,
-    CONSTRAINT fk_rep_toro       FOREIGN KEY (id_toro)
-        REFERENCES tbl_animal(id_animal) ON UPDATE CASCADE ON DELETE SET NULL,
-    CONSTRAINT fk_rep_causa      FOREIGN KEY (id_causa)
-        REFERENCES tbl_causa(id_causa) ON UPDATE CASCADE ON DELETE SET NULL,
-    CONSTRAINT fk_rep_vet        FOREIGN KEY (id_veterinario)
-        REFERENCES tbl_colaborador(id_colaborador) ON UPDATE CASCADE ON DELETE SET NULL,
-    CONSTRAINT fk_rep_usuario    FOREIGN KEY (id_usuario)
-        REFERENCES tbl_usuario(id_usuario) ON UPDATE CASCADE ON DELETE SET NULL,
-    INDEX idx_rep_fecha  (fecha_evento),
-    INDEX idx_rep_tipo   (tipo_evento),
-    INDEX idx_rep_animal (id_animal)
-) ENGINE=InnoDB COMMENT='Registro de eventos reproductivos (IA, monta, parto, aborto, etc.)';
+CREATE TABLE tbl_ciclo_reproductivo (
+    id_ciclo INT AUTO_INCREMENT PRIMARY KEY COMMENT 'Identificador único del ciclo',
+    id_animal INT NOT NULL COMMENT 'Vaca que inicia el ciclo',
+    fecha_inicio DATE NOT NULL COMMENT 'Fecha real de la monta o inseminación (Día 0)',
+    tipo_evento ENUM('Monta Natural', 'Inseminación Artificial') NOT NULL COMMENT 'Método reproductivo utilizado',
+    id_veterinario_inicio INT NULL COMMENT 'Colaborador/Veterinario que realizó la monta/IA',
+    
+    -- Fechas calculadas automáticamente (Día 0)
+    fecha_estimada_palp1 DATE NOT NULL COMMENT 'fecha_inicio + 30 días',
+    fecha_estimada_palp2 DATE NOT NULL COMMENT 'fecha_inicio + 60 días',
+    fecha_estimada_parto DATE NOT NULL COMMENT 'fecha_inicio + 283 días',
+    
+    -- Estado global (Controlado por Triggers/SPs)
+    estado_ciclo ENUM('Pendiente Palpación 1', 'Preñez Provisional', 'Vacía', 'Preñez Confirmada', 'Parto Exitoso', 'Abortado') NOT NULL DEFAULT 'Pendiente Palpación 1' COMMENT 'Estado global e inmutable directamente de la aplicación',
+    
+    -- Datos Palpación 1 (Día ~30)
+    fecha_palpacion1 DATE NULL COMMENT 'Fecha real de la 1ra palpación',
+    resultado_palpacion1 ENUM('Preñada', 'Vacía') NULL COMMENT 'Resultado inmutable de 1ra palpación',
+    id_veterinario_palp1 INT NULL COMMENT 'Veterinario que realizó la 1ra palpación',
+    
+    -- Datos Palpación 2 (Día ~60)
+    fecha_palpacion2 DATE NULL COMMENT 'Fecha real de la 2da palpación',
+    resultado_palpacion2 ENUM('Preñada', 'Vacía') NULL COMMENT 'Resultado inmutable de 2da palpación',
+    id_veterinario_palp2 INT NULL COMMENT 'Veterinario que realizó la 2da palpación',
+    
+    -- Datos Parto (Día ~283)
+    fecha_parto_real DATE NULL COMMENT 'Fecha real del parto/aborto',
+    resultado_parto ENUM('Exitoso', 'Abortado') NULL COMMENT 'Resultado final e inmutable',
+    id_veterinario_parto INT NULL COMMENT 'Veterinario que atendió el parto',
+    
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Fecha de creación del registro en BD (Inmutable)',
+    
+    -- Restricciones de Integridad
+    CONSTRAINT fk_ciclo_animal FOREIGN KEY (id_animal) REFERENCES tbl_animal(id_animal) ON DELETE RESTRICT,
+    CONSTRAINT fk_ciclo_vet_ini FOREIGN KEY (id_veterinario_inicio) REFERENCES tbl_colaborador(id_colaborador) ON DELETE RESTRICT,
+    CONSTRAINT fk_ciclo_vet_p1 FOREIGN KEY (id_veterinario_palp1) REFERENCES tbl_colaborador(id_colaborador) ON DELETE RESTRICT,
+    CONSTRAINT fk_ciclo_vet_p2 FOREIGN KEY (id_veterinario_palp2) REFERENCES tbl_colaborador(id_colaborador) ON DELETE RESTRICT,
+    CONSTRAINT fk_ciclo_vet_parto FOREIGN KEY (id_veterinario_parto) REFERENCES tbl_colaborador(id_colaborador) ON DELETE RESTRICT,
+    
+    CONSTRAINT chk_fecha_p1 CHECK (fecha_palpacion1 IS NULL OR fecha_palpacion1 >= fecha_inicio),
+    CONSTRAINT chk_fecha_p2 CHECK (fecha_palpacion2 IS NULL OR fecha_palpacion2 >= fecha_inicio),
+    CONSTRAINT chk_fecha_parto CHECK (fecha_parto_real IS NULL OR fecha_parto_real >= fecha_inicio)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Registro maestro del ciclo reproductivo por vaca';
+
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-- TABLA DE ALERTAS: tbl_alerta_reproductiva
+-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CREATE TABLE tbl_alerta_reproductiva (
+    id_alerta BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT 'Identificador de la alerta',
+    
+    id_ciclo INT NOT NULL COMMENT 'FK al ciclo reproductivo origen',
+    id_animal INT NOT NULL COMMENT 'FK a la vaca afectada',
+    
+    tipo_alerta ENUM(
+        'Palpación 1',
+        'Palpación 2',
+        'Parto Estimado',
+        'Seguimiento de Celo'
+    ) NOT NULL COMMENT 'Acción requerida',
+    
+    fecha_programada DATE NOT NULL COMMENT 'Fecha para la que se programa el seguimiento',
+    
+    estado_alerta ENUM(
+        'Pendiente',
+        'Completada',
+        'Cancelada'
+    ) NOT NULL DEFAULT 'Pendiente' COMMENT 'Estado resolutivo',
+    
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Fecha de creación en el sistema',
+
+    -- Foreign Keys
+    CONSTRAINT fk_alertarep_ciclo 
+        FOREIGN KEY (id_ciclo)
+        REFERENCES tbl_ciclo_reproductivo(id_ciclo)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_alertarep_animal 
+        FOREIGN KEY (id_animal)
+        REFERENCES tbl_animal(id_animal)
+        ON DELETE RESTRICT
+
+) ENGINE=InnoDB
+DEFAULT CHARSET=utf8mb4
+COLLATE=utf8mb4_unicode_ci
+COMMENT='Alertas generadas por cambios de fase en ciclos reproductivos';
 
 -- ════════════════════════════════════════════════════════════════════════════
 --  BLOQUE 10: MORTALIDAD
@@ -586,7 +630,7 @@ CREATE TABLE tbl_baja_animal (
     id_usuario     INT          NULL,
     fecha_creacion TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_baja_animal  FOREIGN KEY (id_animal)
-        REFERENCES tbl_animal(id_animal) ON UPDATE CASCADE ON DELETE CASCADE,
+        REFERENCES tbl_animal(id_animal) ON UPDATE CASCADE ON DELETE RESTRICT,
     CONSTRAINT fk_baja_causa   FOREIGN KEY (id_causa)
         REFERENCES tbl_causa(id_causa) ON UPDATE CASCADE ON DELETE SET NULL,
     CONSTRAINT fk_baja_usuario FOREIGN KEY (id_usuario)
@@ -605,7 +649,7 @@ CREATE TABLE tbl_categoria_insumo (
     descripcion         VARCHAR(255) NULL,
     activo              BOOLEAN NOT NULL DEFAULT TRUE,
     fecha_creacion      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB COMMENT='Categorías de insumos (concentrado, forraje, medicina, etc.)';
+) ENGINE=InnoDB COMMENT='Categorías de insumos (concentrado, forraje, medicina,.)';
 
 CREATE TABLE tbl_insumo (
     id_insumo           INT AUTO_INCREMENT PRIMARY KEY,
@@ -681,7 +725,7 @@ CREATE TABLE tbl_transaccion_financiera (
     INDEX idx_trans_categoria (categoria)
 ) ENGINE=InnoDB COMMENT='Registro de ingresos y gastos del establecimiento';
 
-USE BD_Hofloc_Gestion;
+USE BD_vaquitas;
 SET FOREIGN_KEY_CHECKS = 0;
 
 -- ════════════════════════════════════════════════════════════════════════════
